@@ -63,6 +63,22 @@ def stub_run_bookkeeping() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def stub_housekeeping() -> Iterator[None]:
+    """
+    Keep the pre-curation cleanup off whatever database the run points at.
+
+    Both housekeeping calls write, and this module stubs its data sources
+    rather than building a schema, so unstubbed they would run against the
+    real library. Tests that care about them re-patch.
+    """
+    with (
+        patch.object(memory_curator, "db_delete_stale_memories", return_value=0),
+        patch.object(memory_curator, "db_prune_empty_memories", return_value=0),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def stub_preferences() -> Iterator[None]:
     with patch.object(
         memory_curator,
@@ -1064,6 +1080,44 @@ class TestRunOrchestration:
             upserts = run_curator(anniversary=make_anniversary_images(2024, 5))
         assert len(of_type(upserts, "anniversary")) == 1
 
+    def test_emptied_memories_are_pruned_before_anything_is_built(self):
+        """
+        Issue #1485: a memory whose photos were deleted is still listed as
+        complete. The deletion paths prune as they go; the run is the net.
+        """
+        order: List[str] = []
+        with (
+            patch.object(
+                memory_curator,
+                "db_prune_empty_memories",
+                side_effect=lambda _: order.append("prune") or 0,
+            ),
+            patch.object(
+                memory_curator,
+                "db_get_anniversary_candidates",
+                side_effect=lambda *a, **k: order.append("curate") or [],
+            ),
+        ):
+            memory_curator.memory_curator_run(reference_date=REFERENCE)
+
+        assert order[0] == "prune"
+
+    def test_pruning_uses_the_configured_minimum(self):
+        with patch.object(
+            memory_curator, "db_prune_empty_memories", return_value=0
+        ) as prune:
+            run_curator(anniversary=make_anniversary_images(2024, 5))
+
+        # The autouse preference stub sets min_images=3; nothing is hardcoded.
+        prune.assert_called_once_with(3)
+
+    def test_a_failing_empty_prune_does_not_stop_the_run(self):
+        with patch.object(
+            memory_curator, "db_prune_empty_memories", side_effect=Exception("locked")
+        ):
+            upserts = run_curator(anniversary=make_anniversary_images(2024, 5))
+        assert len(of_type(upserts, "anniversary")) == 1
+
     def test_recently_used_is_refreshed_between_triggers(self):
         """Later triggers must not reuse what an earlier one just claimed."""
         mocks: Dict[str, Any] = {}
@@ -1071,6 +1125,40 @@ class TestRunOrchestration:
         # Once when the context is built, then once after each of the three
         # triggers, so each sees what its predecessors consumed.
         assert mocks["db_get_recently_used_image_ids"].call_count == 4
+
+
+# ##############################
+# Pruning emptied memories
+# ##############################
+
+
+class TestPruneEmpty:
+    """
+    The entry point the deletion paths call. It has to be safe to call from
+    the middle of a folder delete, so it reports rather than raises.
+    """
+
+    def test_returns_the_number_pruned(self):
+        with patch.object(memory_curator, "db_prune_empty_memories", return_value=2):
+            assert memory_curator.memory_curator_prune_empty() == 2
+
+    def test_a_failure_is_swallowed(self):
+        with patch.object(
+            memory_curator, "db_prune_empty_memories", side_effect=Exception("locked")
+        ):
+            assert memory_curator.memory_curator_prune_empty() == 0
+
+    def test_unreadable_preferences_do_not_raise(self):
+        with (
+            patch.object(
+                memory_curator,
+                "memory_curator_get_preferences",
+                side_effect=Exception("db down"),
+            ),
+            patch.object(memory_curator, "db_prune_empty_memories") as prune,
+        ):
+            assert memory_curator.memory_curator_prune_empty() == 0
+        prune.assert_not_called()
 
 
 # ##############################

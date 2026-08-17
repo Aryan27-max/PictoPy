@@ -85,6 +85,27 @@ def images(test_db: str) -> List[str]:
     return image_ids
 
 
+@pytest.fixture
+def videos(test_db: str, images: List[str]) -> List[str]:
+    """Insert two clips in the same folder as the images and return their ids."""
+    conn = sqlite3.connect(test_db)
+    video_ids = [f"vid-{i}" for i in range(2)]
+    for i, video_id in enumerate(video_ids):
+        conn.execute(
+            "INSERT INTO videos (id, path, folder_id, thumbnailPath, captured_at) "
+            "VALUES (?, ?, 'folder-1', ?, ?)",
+            (
+                video_id,
+                f"/photos/{i}.mp4",
+                f"/thumbs/{i}.mp4",
+                f"2024-06-15 1{i}:30:00",
+            ),
+        )
+    conn.commit()
+    conn.close()
+    return video_ids
+
+
 def make_memory(dedupe_key: str, **overrides: Any) -> Dict[str, Any]:
     memory: Dict[str, Any] = {
         "memory_id": str(uuid.uuid4()),
@@ -334,6 +355,64 @@ class TestMarkAndPrune:
         assert db_get_memory(shrink)["status"] == "empty"
         assert db_get_memory(keep)["status"] == "complete"
 
+    def test_prune_marks_an_emptied_memory_empty(self, images: List[str]):
+        """Issue #1485: every source photo gone, so there is nothing to show."""
+        memory_id = db_upsert_memory(make_memory("k"), entries(images))
+
+        db_delete_images_by_ids(images)
+
+        assert db_prune_empty_memories(3) == 1
+        assert db_get_memory(memory_id)["status"] == "empty"
+        assert db_list_memories()[1] == 0
+
+    @pytest.mark.parametrize(
+        "remaining, expected_status",
+        [(3, "complete"), (2, "empty")],
+    )
+    def test_prune_boundary_is_the_minimum_itself(
+        self, images: List[str], remaining: int, expected_status: str
+    ):
+        """At the minimum a memory survives; one photo below it does not."""
+        memory_id = db_upsert_memory(make_memory("k"), entries(images))
+
+        db_delete_images_by_ids(images[remaining:])
+
+        db_prune_empty_memories(3)
+        assert db_get_memory(memory_id)["status"] == expected_status
+
+    def test_prune_keeps_a_partly_emptied_memory(self, images: List[str]):
+        """Losing some photos is not losing the memory; the count just drops."""
+        memory_id = db_upsert_memory(
+            make_memory("k", image_count=len(images)), entries(images)
+        )
+
+        db_delete_images_by_ids(images[:2])
+
+        assert db_prune_empty_memories(3) == 0
+        stored = db_get_memory(memory_id)
+        assert stored["status"] == "complete"
+        assert stored["live_image_count"] == 3
+        assert db_list_memories()[1] == 1
+
+    def test_prune_preserves_user_state(self, images: List[str]):
+        memory_id = db_upsert_memory(make_memory("k"), entries(images))
+        db_mark_memory(memory_id, viewed=True, dismissed=True, notified=True)
+
+        db_delete_images_by_ids(images)
+        db_prune_empty_memories(3)
+
+        stored = db_get_memory(memory_id)
+        assert stored["viewed_at"] is not None
+        assert stored["notified_at"] is not None
+        assert stored["dismissed"] is True
+
+    def test_prune_is_idempotent(self, images: List[str]):
+        db_upsert_memory(make_memory("k"), entries(images))
+        db_delete_images_by_ids(images)
+
+        assert db_prune_empty_memories(3) == 1
+        assert db_prune_empty_memories(3) == 0
+
 
 # ##############################
 # Stale memories
@@ -479,8 +558,12 @@ class TestListAndSurface:
         assert db_list_memories()[1] == 0
 
     def test_list_paginates_newest_first(self, images: List[str]):
-        db_upsert_memory(make_memory("old", surface_date="2026-07-01"), [])
-        db_upsert_memory(make_memory("new", surface_date="2026-07-20"), [])
+        db_upsert_memory(
+            make_memory("old", surface_date="2026-07-01"), entries(images[:2])
+        )
+        db_upsert_memory(
+            make_memory("new", surface_date="2026-07-20"), entries(images[2:4])
+        )
 
         rows, total = db_list_memories(limit=1, offset=0)
         assert total == 2
@@ -488,9 +571,18 @@ class TestListAndSurface:
         assert db_list_memories(limit=1, offset=1)[0][0]["dedupe_key"] == "old"
 
     def test_surfaceable_prefers_recent_then_highest_score(self, images: List[str]):
-        db_upsert_memory(make_memory("older", surface_date="2026-07-01", score=0.9), [])
-        db_upsert_memory(make_memory("low", surface_date="2026-07-20", score=0.2), [])
-        db_upsert_memory(make_memory("high", surface_date="2026-07-20", score=0.8), [])
+        db_upsert_memory(
+            make_memory("older", surface_date="2026-07-01", score=0.9),
+            entries(images[:2]),
+        )
+        db_upsert_memory(
+            make_memory("low", surface_date="2026-07-20", score=0.2),
+            entries(images[2:4]),
+        )
+        db_upsert_memory(
+            make_memory("high", surface_date="2026-07-20", score=0.8),
+            entries(images[4:]),
+        )
 
         assert db_get_surfaceable_memory("2026-07-26")["dedupe_key"] == "high"
 
@@ -519,6 +611,61 @@ class TestListAndSurface:
 
         assert db_count_unviewed_memories("2026-07-26") == 2
         db_mark_memory(first, viewed=True)
+        assert db_count_unviewed_memories("2026-07-26") == 1
+
+
+class TestSurfacingSkipsEmptyMemories:
+    """
+    Issue #1485. Pruning is what should take an emptied memory off the grid;
+    these cover the case where it did not run, so a memory with nothing left
+    to render still never reaches the UI.
+    """
+
+    def test_list_excludes_a_memory_with_no_live_media(self, images: List[str]):
+        db_upsert_memory(make_memory("gone"), entries(images[:2]))
+        db_upsert_memory(make_memory("kept"), entries(images[2:4]))
+
+        db_delete_images_by_ids(images[:2])
+
+        rows, total = db_list_memories()
+        assert total == 1
+        assert [row["dedupe_key"] for row in rows] == ["kept"]
+
+    def test_surfaceable_excludes_a_memory_with_no_live_media(self, images: List[str]):
+        db_upsert_memory(make_memory("k"), entries(images[:2]))
+
+        db_delete_images_by_ids(images[:2])
+
+        assert db_get_surfaceable_memory("2026-07-26") is None
+
+    def test_unviewed_count_excludes_a_memory_with_no_live_media(
+        self, images: List[str]
+    ):
+        db_upsert_memory(make_memory("k"), entries(images[:2]))
+
+        db_delete_images_by_ids(images[:2])
+
+        assert db_count_unviewed_memories("2026-07-26") == 0
+
+    def test_a_memory_that_kept_its_clips_is_still_surfaced(
+        self, images: List[str], videos: List[str]
+    ):
+        """
+        Guards the videos half of the filter. Curation cannot build a memory
+        without photos, but one whose photos were deleted while its clips
+        survived still has slides to play - hiding it would be a regression,
+        not a cleanup.
+        """
+        db_upsert_memory(
+            make_memory("k"),
+            entries(images[:2]),
+            [(video_id, i, 0.5) for i, video_id in enumerate(videos)],
+        )
+
+        db_delete_images_by_ids(images[:2])
+
+        assert db_list_memories()[1] == 1
+        assert db_get_surfaceable_memory("2026-07-26")["dedupe_key"] == "k"
         assert db_count_unviewed_memories("2026-07-26") == 1
 
 

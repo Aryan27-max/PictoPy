@@ -88,6 +88,23 @@ def _curate_memories(trigger: str) -> None:
         logger.error(f"Memory curation failed after {trigger}: {e}")
 
 
+def _prune_empty_memories() -> None:
+    """
+    Take memories the just-deleted photos emptied off the grid.
+
+    Imported late for the same reason as _curate_memories. Run inline rather
+    than queued: the response is what the UI refetches on, so a queued prune
+    would race it. It costs one UPDATE over the memories table, not a library
+    scan, which is why a full curation run would be the wrong tool here.
+    """
+    try:
+        from app.utils.memory_curator import memory_curator_prune_empty
+
+        memory_curator_prune_empty()
+    except Exception as e:
+        logger.error(f"Memory cleanup failed after folder deletion: {e}")
+
+
 def _queue_post_index_tagging_sweep(index_future: Future, app_state: State) -> None:
     """
     Runs after folder indexing completes to trigger a follow-up tagging sweep.
@@ -424,6 +441,10 @@ def delete_folders(request: DeleteFoldersRequest):
             raise ValueError("No folder IDs provided")
 
         deleted_count = db_delete_folders_batch(request.folder_ids)
+
+        # The folder's images went with it, and their memory_images rows
+        # cascaded out, so any memory built only from them is now empty.
+        _prune_empty_memories()
 
         return DeleteFoldersResponse(
             data=DeleteFoldersData(

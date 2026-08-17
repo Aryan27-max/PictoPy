@@ -44,6 +44,7 @@ from app.database.memories import (
     db_get_scoring_signals,
     db_get_top_memory_label,
     db_get_recent_dated_images,
+    db_prune_empty_memories,
     db_start_memory_run,
     db_update_memory_scores,
     db_upsert_memory,
@@ -950,6 +951,30 @@ def memory_curator_rescore_for_cluster(cluster_id: str) -> int:
     return memory_curator_rescore(db_get_memory_ids_for_cluster(cluster_id))
 
 
+def memory_curator_prune_empty() -> int:
+    """
+    Take memories the library has emptied off the grid. Returns the count.
+
+    Deleting a folder, or losing files from disk, cascades rows out of
+    memory_images and leaves a memory still marked complete with nothing to
+    show. No rebuild reaches it either: its photos are gone, so the candidate
+    pools that produced it can never produce it again.
+
+    Reads the minimum itself rather than taking one, so the deletion paths
+    prune on exactly the threshold curation built the memories with. Never
+    raises: every caller is finishing a deletion the user asked for, and none
+    of them should fail over a memory card.
+    """
+    try:
+        pruned = db_prune_empty_memories(memory_curator_get_preferences().min_images)
+        if pruned:
+            logger.info(f"Marked {pruned} memories empty after their media was removed")
+        return pruned
+    except Exception:
+        logger.error("Failed to prune empty memories", exc_info=True)
+        return 0
+
+
 def _release_claimed_run(run_date: str) -> None:
     """
     Close a run a caller claimed before handing off to this process.
@@ -1003,6 +1028,12 @@ def memory_curator_run(
                 logger.info(f"Dropped {stale} memories whose capture dates moved")
         except Exception:
             logger.error("Failed to drop stale memories", exc_info=True)
+
+        # Same reason, different cause: a memory can also be emptied outright
+        # by its photos being deleted. The deletion paths prune as they go, so
+        # this is the net that catches anything they missed. Swallows its own
+        # failures, so it cannot cost the run the memories it came to make.
+        memory_curator_prune_empty()
 
         context = _CurationContext(reference, preferences, params_signature)
 

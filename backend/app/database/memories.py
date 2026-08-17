@@ -34,6 +34,23 @@ def _check_in(column: str, values: Sequence[str]) -> str:
 MemoryImageEntry = Tuple[ImageId, int, Optional[float]]
 MemoryVideoEntry = Tuple[VideoId, int, Optional[float]]
 
+# Defence in depth for the three queries that surface a memory to the user.
+# Pruning is what is supposed to take an emptied memory off the grid, but a
+# memory whose media has all been deleted has no cover and no slides, so it
+# must never be offered as a card even if a prune was missed.
+#
+# Videos count here, deliberately. Curation cannot build a memory without
+# photos, so this clause never overrules db_prune_empty_memories' image-only
+# threshold; but a memory that lost its photos and kept its clips still has
+# something to play, and dropping it would be a regression, not a cleanup.
+#
+# Both branches seek a junction table's primary key, whose leading column is
+# memory_id, so this costs a lookup per row rather than a scan.
+_HAS_LIVE_MEDIA = (
+    "(EXISTS (SELECT 1 FROM memory_images mi WHERE mi.memory_id = m.memory_id)"
+    " OR EXISTS (SELECT 1 FROM memory_videos mv WHERE mv.memory_id = m.memory_id))"
+)
+
 # Columns settable by db_upsert_memory. memory_id, viewed_at, notified_at and
 # dismissed are deliberately excluded: re-curation replaces contents without
 # resetting what the user has already seen.
@@ -655,7 +672,7 @@ def db_list_memories(
     include_dismissed: bool = False,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """List memory cards newest first. Returns (rows, total matching count)."""
-    filters = ["m.status = 'complete'"]
+    filters = ["m.status = 'complete'", _HAS_LIVE_MEDIA]
     params: List[Any] = []
 
     if event_type:
@@ -711,7 +728,7 @@ def db_get_surfaceable_memory(reference_date: str) -> Optional[Dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
-            """
+            f"""
             SELECT m.*,
                    (SELECT COUNT(*) FROM memory_images mi
                      WHERE mi.memory_id = m.memory_id) AS live_image_count,
@@ -722,6 +739,7 @@ def db_get_surfaceable_memory(reference_date: str) -> Optional[Dict[str, Any]]:
               AND m.viewed_at IS NULL
               AND m.dismissed = 0
               AND m.surface_date <= ?
+              AND {_HAS_LIVE_MEDIA}
             ORDER BY m.surface_date DESC, m.score DESC
             LIMIT 1
             """,
@@ -780,16 +798,22 @@ def db_get_recently_used_image_ids(days: int, reference_date: str) -> Set[ImageI
 
 
 def db_count_unviewed_memories(reference_date: str) -> int:
-    """Count surfaceable memories the user has not opened yet."""
+    """
+    Count surfaceable memories the user has not opened yet.
+
+    Filtered exactly like db_get_surfaceable_memory: a badge promising a
+    memory that /today then declines to return is worse than no badge.
+    """
     conn = None
     try:
         conn = _connect()
         cursor = conn.cursor()
         cursor.execute(
-            """
-            SELECT COUNT(*) FROM memories
-            WHERE status = 'complete' AND viewed_at IS NULL
-              AND dismissed = 0 AND surface_date <= ?
+            f"""
+            SELECT COUNT(*) FROM memories m
+            WHERE m.status = 'complete' AND m.viewed_at IS NULL
+              AND m.dismissed = 0 AND m.surface_date <= ?
+              AND {_HAS_LIVE_MEDIA}
             """,
             (reference_date,),
         )

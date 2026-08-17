@@ -19,6 +19,14 @@ from app.database.images import (
     db_create_images_table,
     db_get_image_sync_state_by_folder_ids,
 )
+from app.database.memories import (
+    db_create_memories_table,
+    db_get_memory,
+    db_list_memories,
+    db_upsert_memory,
+)
+from app.database.metadata import db_create_metadata_table
+from app.database.videos import db_create_videos_table
 from app.database.yolo_mapping import db_create_YOLO_classes_table
 from app.utils.images import (
     image_util_extract_metadata,
@@ -39,10 +47,17 @@ def test_db(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     monkeypatch.setattr("app.database.images.DATABASE_PATH", db_path)
     monkeypatch.setattr("app.database.folders.DATABASE_PATH", db_path)
     monkeypatch.setattr("app.database.yolo_mapping.DATABASE_PATH", db_path)
+    monkeypatch.setattr("app.database.videos.DATABASE_PATH", db_path)
+    # Dropping obsolete images now prunes the memories they emptied, which
+    # reads the minimum out of the metadata blob.
+    monkeypatch.setattr("app.database.metadata.DATABASE_PATH", db_path)
 
     db_create_YOLO_classes_table()  # mappings (image_classes FK target)
     db_create_folders_table()  # folders (images.folder_id FK target)
     db_create_images_table()
+    db_create_videos_table()  # memory_videos FK target
+    db_create_metadata_table()
+    db_create_memories_table()
 
     yield db_path
 
@@ -315,29 +330,31 @@ class TestSyncStateQuery:
         assert image_util_is_unchanged(path, recorded) is False
 
 
+@pytest.fixture
+def library(tmp_path, test_db, monkeypatch):
+    """A folder of five real photos, registered and ready to walk."""
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    thumbs = tmp_path / "thumbs"
+    thumbs.mkdir()
+    monkeypatch.setattr("app.utils.images.THUMBNAIL_IMAGES_PATH", str(thumbs))
+
+    for index in range(5):
+        _photo(photos / f"p{index}.jpg", (index * 20, 40, 90))
+
+    conn = sqlite3.connect(test_db)
+    conn.execute(
+        "INSERT INTO folders (folder_id, folder_path, last_modified_time, "
+        "AI_Tagging) VALUES (?, ?, 0, 1)",
+        ("folder-1", str(photos)),
+    )
+    conn.commit()
+    conn.close()
+    return photos
+
+
 class TestRescanningAFolder:
     """The whole point: the second walk over an untouched folder does no work."""
-
-    @pytest.fixture
-    def library(self, tmp_path, test_db, monkeypatch):
-        photos = tmp_path / "photos"
-        photos.mkdir()
-        thumbs = tmp_path / "thumbs"
-        thumbs.mkdir()
-        monkeypatch.setattr("app.utils.images.THUMBNAIL_IMAGES_PATH", str(thumbs))
-
-        for index in range(5):
-            _photo(photos / f"p{index}.jpg", (index * 20, 40, 90))
-
-        conn = sqlite3.connect(test_db)
-        conn.execute(
-            "INSERT INTO folders (folder_id, folder_path, last_modified_time, "
-            "AI_Tagging) VALUES (?, ?, 0, 1)",
-            ("folder-1", str(photos)),
-        )
-        conn.commit()
-        conn.close()
-        return photos
 
     @pytest.fixture
     def generated(self, monkeypatch) -> List[str]:
@@ -392,6 +409,65 @@ class TestRescanningAFolder:
         conn.close()
 
         assert before == after
+
+
+class TestRescanPrunesEmptiedMemories:
+    """
+    Issue #1485, reached without deleting a folder: files vanish from disk,
+    the rescan drops their rows, and their memory_images rows cascade out.
+    """
+
+    def _curate(self, test_db: str) -> str:
+        """Build a memory over every indexed photo, as curation would."""
+        conn = sqlite3.connect(test_db)
+        image_ids = [row[0] for row in conn.execute("SELECT id FROM images")]
+        conn.close()
+
+        return db_upsert_memory(
+            {
+                "memory_id": "mem-1",
+                "dedupe_key": "import:2024-06-15",
+                "event_type": "import_event",
+                "status": "complete",
+                "title": "15 June 2024",
+                "surface_date": "2026-07-26",
+                "cover_image_id": image_ids[0],
+                "image_count": len(image_ids),
+                "score": 0.9,
+            },
+            [(image_id, i, 0.5) for i, image_id in enumerate(image_ids)],
+        )
+
+    def test_files_vanishing_from_disk_prune_their_memory(self, library, test_db):
+        folder_data = [(str(library), "folder-1", False)]
+        image_util_process_folder_images(folder_data)
+        memory_id = self._curate(test_db)
+        assert db_list_memories()[1] == 1
+
+        for photo in library.glob("*.jpg"):
+            os.unlink(photo)
+        image_util_process_folder_images(folder_data)
+
+        assert db_get_memory(memory_id)["status"] == "empty"
+        assert db_list_memories()[1] == 0
+
+    def test_a_rescan_that_loses_nothing_prunes_nothing(
+        self, library, test_db, monkeypatch
+    ):
+        """The prune rides on an actual deletion, not on every walk."""
+        folder_data = [(str(library), "folder-1", False)]
+        image_util_process_folder_images(folder_data)
+        memory_id = self._curate(test_db)
+
+        calls: List[int] = []
+        monkeypatch.setattr(
+            "app.utils.memory_curator.db_prune_empty_memories",
+            lambda minimum: calls.append(minimum) or 0,
+        )
+        image_util_process_folder_images(folder_data)
+
+        assert calls == []
+        assert db_get_memory(memory_id)["status"] == "complete"
 
 
 class TestExtractMetadataRecordsMtime:

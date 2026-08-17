@@ -5,6 +5,7 @@ import { configureStore } from '@reduxjs/toolkit';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { rootReducer } from '@/app/store';
 import { useFolderOperations } from '@/hooks/useFolderOperations';
+import { MEMORIES_QUERY_KEY } from '@/hooks/useMemories';
 import * as foldersApi from '@/api/api-functions/folders';
 
 jest.mock('@/api/api-functions/folders', () => ({
@@ -42,10 +43,12 @@ function renderUseFolderOperations() {
   return { ...rendered, invalidateSpy };
 }
 
-const clustersKeyCalls = (spy: jest.SpyInstance) =>
+const keyCalls = (spy: jest.SpyInstance, key: readonly unknown[]) =>
   spy.mock.calls.filter(
-    ([arg]) => JSON.stringify(arg?.queryKey) === JSON.stringify(['clusters']),
+    ([arg]) => JSON.stringify(arg?.queryKey) === JSON.stringify(key),
   );
+
+const clustersKeyCalls = (spy: jest.SpyInstance) => keyCalls(spy, ['clusters']);
 
 describe('useFolderOperations - delete folder cache invalidation', () => {
   beforeEach(() => {
@@ -60,6 +63,21 @@ describe('useFolderOperations - delete folder cache invalidation', () => {
 
     await waitFor(() => {
       expect(clustersKeyCalls(invalidateSpy).length).toBeGreaterThan(0);
+    });
+  });
+
+  // Issue #1485: the backend prunes the memories the deleted photos emptied,
+  // but the grid kept serving them from cache until something refetched.
+  it('invalidates the memories query when folder deletion succeeds', async () => {
+    deleteFolders.mockResolvedValueOnce({ success: true, data: {} });
+    const { result, invalidateSpy } = renderUseFolderOperations();
+
+    result.current.deleteFolder('folder-1');
+
+    await waitFor(() => {
+      expect(
+        keyCalls(invalidateSpy, MEMORIES_QUERY_KEY).length,
+      ).toBeGreaterThan(0);
     });
   });
 

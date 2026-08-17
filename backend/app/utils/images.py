@@ -460,6 +460,14 @@ def image_util_remove_obsolete_images(folder_id_list: List[int]) -> int:
     if obsolete_images:
         db_delete_images_by_ids(obsolete_images)
         logger.info(f"Removed {len(obsolete_images)} obsolete image(s) from database")
+        # Their memory_images rows cascaded out with them, so a memory can be
+        # left with nothing to show. Done here rather than left to the curation
+        # that follows a sync: that run is skipped entirely when the user has
+        # memories turned off, but the grid still lists what was built before.
+        # Imported late to keep the curator out of the indexing import graph.
+        from app.utils.memory_curator import memory_curator_prune_empty
+
+        memory_curator_prune_empty()
 
     return len(obsolete_images)
 

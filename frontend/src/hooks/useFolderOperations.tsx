@@ -13,6 +13,7 @@ import { setFolders, setTaggingStatus } from '@/features/folderSlice';
 import { FolderDetails, isIndexingPending } from '@/types/Folder';
 import { useMutationFeedback } from './useMutationFeedback';
 import { getFoldersTaggingStatus } from '@/api/api-functions/folders';
+import { MEMORIES_QUERY_KEY } from '@/hooks/useMemories';
 
 /**
  * Custom hook for folder operations
@@ -142,6 +143,10 @@ export const useFolderOperations = () => {
     // would match neither query.
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['clusters'] });
+      // Memories built from those photos are emptied by the same cascade, and
+      // the backend prunes them before it answers, so the refetch this
+      // triggers already sees them gone.
+      queryClient.invalidateQueries({ queryKey: MEMORIES_QUERY_KEY });
     },
   });
 

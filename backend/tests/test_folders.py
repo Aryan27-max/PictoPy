@@ -38,6 +38,13 @@ from app.database.folders import (
 from app.database.images import db_create_images_table
 from app.database.videos import db_create_videos_table
 from app.database.yolo_mapping import db_create_YOLO_classes_table
+from app.database.memories import (
+    db_create_memories_table,
+    db_get_memory,
+    db_list_memories,
+    db_upsert_memory,
+)
+from app.database.metadata import db_create_metadata_table
 
 # ##############################
 # Pytest Fixtures
@@ -55,6 +62,9 @@ def test_db(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         monkeypatch.setattr("app.database.images.DATABASE_PATH", db_path)
         monkeypatch.setattr("app.database.videos.DATABASE_PATH", db_path)
         monkeypatch.setattr("app.database.yolo_mapping.DATABASE_PATH", db_path)
+        # app.database.memories connects through images._connect, so it needs
+        # no patch of its own; metadata holds its own module-level path.
+        monkeypatch.setattr("app.database.metadata.DATABASE_PATH", db_path)
 
         # Build the real schema rather than a hand-written copy: a divergent
         # CREATE silently reorders columns and drops the ON DELETE CASCADE.
@@ -64,6 +74,10 @@ def test_db(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         db_create_folders_table()
         db_create_images_table()  # db_get_all_folder_details LEFT JOINs it
         db_create_videos_table()  # db_get_all_folder_details LEFT JOINs it too
+        # Deleting a folder now prunes the memories its photos emptied, which
+        # reads the minimum out of the metadata blob.
+        db_create_metadata_table()
+        db_create_memories_table()
 
         yield db_path
     finally:
@@ -666,6 +680,105 @@ class TestFoldersAPI:
         data = response.json()
         assert data["detail"]["success"] is False
         assert data["detail"]["error"] == "Internal server error"
+
+    def _seed_memory(self, test_db, folder_id, prefix, dedupe_key):
+        """
+        A folder of six photos and a memory built from exactly those.
+
+        Six clears the default minimum of five, so only an actual emptying
+        can prune it.
+        """
+        db_insert_folders_batch(
+            [(folder_id, f"/tmp/{prefix}", None, 1693526400, True, True)]
+        )
+        image_ids = [f"{prefix}-{i}" for i in range(6)]
+        conn = sqlite3.connect(test_db)
+        for i, image_id in enumerate(image_ids):
+            conn.execute(
+                "INSERT INTO images (id, path, folder_id, thumbnailPath, captured_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    image_id,
+                    f"/tmp/{prefix}/{i}.jpg",
+                    folder_id,
+                    f"/thumbs/{prefix}-{i}.jpg",
+                    f"2024-06-15 1{i}:00:00",
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+        return db_upsert_memory(
+            {
+                "memory_id": f"mem-{prefix}",
+                "dedupe_key": dedupe_key,
+                "event_type": "import_event",
+                "status": "complete",
+                "title": "15 June 2024",
+                "surface_date": "2026-07-26",
+                "cover_image_id": image_ids[0],
+                "image_count": len(image_ids),
+                "score": 0.9,
+            },
+            [(image_id, i, 0.5) for i, image_id in enumerate(image_ids)],
+        )
+
+    def _delete_folder(self, client, folder_id):
+        return client.request(
+            "DELETE",
+            "/folders/delete-folders",
+            content=f'{{"folder_ids": ["{folder_id}"]}}',
+            headers={"Content-Type": "application/json"},
+        )
+
+    def test_delete_folders_prunes_the_memories_it_empties(self, client, test_db):
+        """
+        Issue #1485: the folder's photos cascade out of memory_images, and the
+        memory they built was left listed as complete with nothing to show.
+        """
+        memory_id = self._seed_memory(test_db, "folder-1", "photos", "import:a")
+        assert db_list_memories()[1] == 1
+
+        assert self._delete_folder(client, "folder-1").status_code == 200
+
+        conn = sqlite3.connect(test_db)
+        counts = conn.execute(
+            "SELECT (SELECT COUNT(*) FROM folders), (SELECT COUNT(*) FROM images), "
+            "(SELECT COUNT(*) FROM memory_images)"
+        ).fetchone()
+        conn.close()
+        assert counts == (0, 0, 0)
+
+        assert db_get_memory(memory_id)["status"] == "empty"
+        assert db_list_memories()[1] == 0
+
+    def test_delete_folders_leaves_other_memories_alone(self, client, test_db):
+        emptied = self._seed_memory(test_db, "folder-1", "photos", "import:a")
+        kept = self._seed_memory(test_db, "folder-2", "trip", "import:b")
+
+        assert self._delete_folder(client, "folder-1").status_code == 200
+
+        assert db_get_memory(emptied)["status"] == "empty"
+        assert db_get_memory(kept)["status"] == "complete"
+        rows, total = db_list_memories()
+        assert total == 1
+        assert rows[0]["memory_id"] == kept
+
+    @patch("app.routes.folders.db_delete_folders_batch")
+    def test_delete_folders_survives_a_failing_memory_cleanup(
+        self, mock_delete_batch, client
+    ):
+        """Losing a memory card must never fail the deletion the user asked for."""
+        mock_delete_batch.return_value = 1
+
+        with patch(
+            "app.utils.memory_curator.db_prune_empty_memories",
+            side_effect=Exception("database is locked"),
+        ):
+            response = self._delete_folder(client, "folder-1")
+
+        assert response.status_code == 200
+        assert response.json()["data"]["deleted_count"] == 1
 
     # ============================================================================
     # GET /folders/all-folders - Get All Folders Tests
